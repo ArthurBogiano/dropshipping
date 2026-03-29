@@ -8,6 +8,7 @@ const { DatabaseSync } = require('node:sqlite');
 const DEFAULT_WEBHOOK_URL = 'https://example.com/webhook';
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), 'mercadolivre-products.sqlite');
 const DEFAULT_MAX_PAGES = 5;
+const MIN_DELAY_BETWEEN_SEARCHES_MS = 1000;
 const SEARCH_PAGE_SIZE = 48;
 const PROMOTION_FILTERS = {
   deal_of_the_day: {
@@ -119,7 +120,7 @@ function getHelpText() {
     '  -h, --help                 Exibe esta ajuda',
     '  --cookies <arquivo>       Caminho do arquivo de cookies JSON',
     '  --db <arquivo>            Caminho do banco SQLite local',
-    '  --targets-file <arquivo>  Arquivo TXT com uma URL de categoria/listagem por linha',
+    '  --targets-file <arquivo>  Arquivo JSON com categorias, chatid e lista de URLs',
     '  --limit <n>               Limite de produtos extraidos de uma listagem',
     '  --max-pages <n>           Maximo de paginas extras buscadas em listagens/ofertas',
     '  --compact                 Exibe o JSON sem identacao',
@@ -137,14 +138,22 @@ function getHelpText() {
     'Exemplos:',
     '  node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB12345678"',
     '  node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/notebook" --limit 3',
-    '  node fetch-mercadolivre-products.js --targets-file categorias.txt --limit 5',
+    '  node fetch-mercadolivre-products.js --targets-file targets.json --limit 5',
     '  node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/saude/suplementos-alimentares" --deal-of-day --limit 10',
     '  node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/saude/suplementos-alimentares" --lightning --limit 10',
-    '  node fetch-mercadolivre-products.js --targets-file categorias.txt --deal-of-day --lightning --limit 5',
+    '  node fetch-mercadolivre-products.js --targets-file targets.json --deal-of-day --lightning --limit 5',
     '  node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/ofertas?category=MLB264586" --limit 10 --max-pages 4',
     '  node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB12345678" --affiliate-tag sua_tag',
     '  node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB12345678" --no-affiliate --compact',
     `  webhook padrao: ${DEFAULT_WEBHOOK_URL}`,
+    '',
+    'Formato JSON aceito no --targets-file:',
+    '  {',
+    '    "suplementos": {',
+    '      "chatid": "123@g.us",',
+    '      "targets": ["https://lista.mercadolivre.com.br/saude/suplementos-alimentares/"]',
+    '    }',
+    '  }',
   ].join('\n');
 }
 
@@ -159,19 +168,94 @@ function readCookies(filePath) {
   return parsed;
 }
 
-function readTargetsFile(filePath) {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  const unique = new Set();
+function normalizeTargetList(value, category) {
+  if (!Array.isArray(value)) {
+    throw new Error(`A categoria "${category}" precisa ter uma lista de URLs.`);
+  }
 
-  for (const line of raw.split(/\r?\n/u)) {
-    const target = line.trim();
-    if (!target || target.startsWith('#')) {
+  const unique = new Set();
+  for (const item of value) {
+    const target = typeof item === 'string' ? item.trim() : '';
+    if (!target) {
       continue;
     }
     unique.add(target);
   }
 
   return [...unique];
+}
+
+function normalizeTargetGroup(category, config) {
+  if (!category) {
+    throw new Error('Cada grupo do arquivo JSON precisa ter uma categoria.');
+  }
+
+  if (Array.isArray(config)) {
+    return {
+      category,
+      chatId: null,
+      targets: normalizeTargetList(config, category),
+    };
+  }
+
+  if (!config || typeof config !== 'object') {
+    throw new Error(`Configuracao invalida para a categoria "${category}".`);
+  }
+
+  const targets = normalizeTargetList(
+    config.targets || config.urls || config.links || config.lista,
+    category
+  );
+
+  return {
+    category,
+    chatId: typeof config.chatid === 'string' ? config.chatid.trim() || null : null,
+    targets,
+  };
+}
+
+function readTargetsFile(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const parsed = JSON.parse(raw);
+
+  if (Array.isArray(parsed)) {
+    return parsed.map((entry, index) => {
+      if (!entry || typeof entry !== 'object') {
+        throw new Error(`Entrada invalida na posicao ${index} do arquivo ${filePath}.`);
+      }
+
+      return normalizeTargetGroup(
+        entry.categoria || entry.category,
+        {
+          chatid: entry.chatid,
+          targets: entry.targets || entry.urls || entry.links || entry.lista,
+        }
+      );
+    });
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    const groupedEntries = parsed.categorias || parsed.categories;
+    if (Array.isArray(groupedEntries)) {
+      return groupedEntries.map((entry, index) => {
+        if (!entry || typeof entry !== 'object') {
+          throw new Error(`Entrada invalida na posicao ${index} do arquivo ${filePath}.`);
+        }
+
+        return normalizeTargetGroup(
+          entry.categoria || entry.category,
+          {
+            chatid: entry.chatid,
+            targets: entry.targets || entry.urls || entry.links || entry.lista,
+          }
+        );
+      });
+    }
+
+    return Object.entries(parsed).map(([category, config]) => normalizeTargetGroup(category, config));
+  }
+
+  throw new Error(`O arquivo de targets precisa ser um JSON valido: ${filePath}`);
 }
 
 function getSearchVariants(args) {
@@ -190,6 +274,12 @@ function getSearchVariants(args) {
 
   variants.push({ label: 'padrao', promotionType: null });
   return variants;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function openDatabase(dbPath) {
@@ -781,7 +871,21 @@ function buildProductPayload({ requestedUrl, finalUrl, html, affiliate = null })
 function isLikelyListingUrl(target) {
   try {
     const url = new URL(target);
-    return /lista\.mercadolivre\.com\.br/i.test(url.hostname) || /\/jm\/search/i.test(url.pathname) || /\/ofertas/i.test(url.pathname);
+    return (
+      /lista\.mercadolivre\.com\.br/i.test(url.hostname) ||
+      /\/jm\/search/i.test(url.pathname) ||
+      /\/ofertas/i.test(url.pathname) ||
+      /^\/c\/[^/]+\/?$/i.test(url.pathname)
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+function isCategoryLandingUrl(target) {
+  try {
+    const url = new URL(target);
+    return /^\/c\/[^/]+\/?$/i.test(url.pathname);
   } catch (_) {
     return false;
   }
@@ -863,6 +967,7 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
   const affiliateTag = options.affiliateTag || (getCookieValue(cookies, 'orgnickp') || '').trim().toLowerCase() || null;
   const db = options.db;
   const maxPages = Math.max(1, Number(options.maxPages || 1));
+  const listingMaxPages = isCategoryLandingUrl(target) ? 1 : maxPages;
 
   if (isLikelyListingUrl(target)) {
     const products = [];
@@ -870,9 +975,9 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
     const seenInRun = new Set();
     let skippedDuplicates = 0;
 
-    for (let pageNumber = 1; pageNumber <= maxPages && products.length < limit; pageNumber += 1) {
+    for (let pageNumber = 1; pageNumber <= listingMaxPages && products.length < limit; pageNumber += 1) {
       const pageUrl = buildListingPageUrl(target, pageNumber);
-      logInfo(`varrendo pagina ${pageNumber}/${maxPages}: ${pageUrl}`);
+      logInfo(`varrendo pagina ${pageNumber}/${listingMaxPages}: ${pageUrl}`);
       const listing = await fetchHtml(pageUrl, cookies);
       const productUrls = extractProductUrlsFromListing(listing.html, Math.max(limit * 4, 24));
 
@@ -956,6 +1061,7 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
       affiliateTag,
       skippedDuplicates,
       pagesVisited: pageStats.length,
+      listingMaxPages,
       pageStats,
       products,
     };
@@ -1013,16 +1119,32 @@ async function main() {
     return;
   }
 
+  const targetGroups = [];
+
   if (args.targetsFile) {
-    const fileTargets = readTargetsFile(args.targetsFile);
-    args.targets.push(...fileTargets);
+    const fileTargetGroups = readTargetsFile(args.targetsFile);
+    targetGroups.push(...fileTargetGroups);
   }
 
-  args.targets = [...new Set(args.targets)];
+  if (args.targets.length > 0) {
+    targetGroups.push({
+      category: 'geral',
+      chatId: null,
+      targets: [...new Set(args.targets)],
+    });
+  }
+
   args.promotionTypes = [...new Set(args.promotionTypes)];
 
-  if (args.targets.length === 0) {
-    throw new Error('Uso: node fetch-mercadolivre-products.js <url-do-produto-ou-listagem> [outras-urls] [--targets-file categorias.txt] [--limit 5] [--cookies cookies.json] [--affiliate-tag sua_tag] [--deal-of-day|--lightning] [--no-affiliate]');
+  const normalizedTargetGroups = targetGroups
+    .map((group) => ({
+      ...group,
+      targets: [...new Set(group.targets)],
+    }))
+    .filter((group) => group.targets.length > 0);
+
+  if (normalizedTargetGroups.length === 0) {
+    throw new Error('Uso: node fetch-mercadolivre-products.js <url-do-produto-ou-listagem> [outras-urls] [--targets-file targets.json] [--limit 5] [--cookies cookies.json] [--affiliate-tag sua_tag] [--deal-of-day|--lightning] [--no-affiliate]');
   }
 
   const cookies = readCookies(args.cookies);
@@ -1032,7 +1154,8 @@ async function main() {
   logInfo(`cookies carregados: ${path.basename(args.cookies)}`);
   logInfo(`sqlite: ${args.db}`);
   if (args.targetsFile) {
-    logInfo(`arquivo de categorias: ${args.targetsFile} (${args.targets.length} URL(s))`);
+    const totalTargets = normalizedTargetGroups.reduce((sum, group) => sum + group.targets.length, 0);
+    logInfo(`arquivo de categorias: ${args.targetsFile} (${normalizedTargetGroups.length} categoria(s), ${totalTargets} URL(s))`);
   }
   if (args.promotionTypes.length > 0) {
     logInfo(`filtros promocionais ativos: ${args.promotionTypes.join(', ')}`);
@@ -1040,78 +1163,104 @@ async function main() {
   logInfo(`destino do webhook: ${args.webhook || 'desabilitado'}`);
 
   const searchVariants = getSearchVariants(args);
+  let hasExecutedSearch = false;
 
-  for (const target of args.targets) {
-    const seenTargets = new Set();
-    let remainingLimit = args.limit;
+  for (const group of normalizedTargetGroups) {
+    logInfo(`categoria atual: ${group.category}${group.chatId ? ` | chatid ${group.chatId}` : ''}`);
 
-    for (const variant of searchVariants) {
-      if (remainingLimit <= 0) {
-        logInfo(`limite total atingido para ${target}: ${args.limit} produto(s)`);
-        break;
-      }
+    for (const target of group.targets) {
+      const seenTargets = new Set();
+      let remainingLimit = args.limit;
 
-      const effectiveTarget = applyListingSearchParams(target, {
-        promotionType: variant.promotionType,
-      });
+      for (const variant of searchVariants) {
+        if (remainingLimit <= 0) {
+          logInfo(`limite total atingido para ${target}: ${args.limit} produto(s)`);
+          break;
+        }
 
-      if (seenTargets.has(effectiveTarget)) {
-        continue;
-      }
-      seenTargets.add(effectiveTarget);
-
-      if (effectiveTarget !== target) {
-        logInfo(`filtro aplicado na busca (${variant.label}): ${effectiveTarget}`);
-      }
-      logInfo(`pesquisando (${variant.label}): ${effectiveTarget}`);
-      let result;
-
-      try {
-        result = await collectProductsFromTarget(effectiveTarget, cookies, remainingLimit, {
-          db,
-          affiliate: args.affiliate,
-          affiliateTag: args.affiliateTag,
-          maxPages: args.maxPages,
+        const effectiveTarget = applyListingSearchParams(target, {
+          promotionType: variant.promotionType,
         });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logError(`falha ao processar ${target} (${variant.label}): ${message}`);
-        throw error;
-      }
 
-      results.push({
-        ...result,
-        requestedTarget: target,
-        effectiveTarget,
-        searchVariant: variant.label,
-      });
+        if (seenTargets.has(effectiveTarget)) {
+          continue;
+        }
+        seenTargets.add(effectiveTarget);
 
-      logInfo(`resultado (${variant.label}): ${result.discoveredProducts} produto(s) novos em ${result.type}`);
-      if (result.skippedDuplicates) {
-        logInfo(`duplicados ignorados (${variant.label}): ${result.skippedDuplicates}`);
-      }
-      for (const product of result.products) {
-        const summary = summarizeProduct(product);
-        const priceText = summary.price != null && summary.currency ? `${summary.currency} ${summary.price}` : 'sem preco';
-        const originalPriceText = summary.originalPrice != null && summary.currency ? ` | antes ${summary.currency} ${summary.originalPrice}` : '';
-        const affiliateText = summary.affiliateShortUrl || 'sem meli.la';
-        logInfo(`item ${summary.itemId || '-'} | ${summary.title || 'sem titulo'} | ${priceText}${originalPriceText} | ${affiliateText}`);
-      }
+        if (effectiveTarget !== target) {
+          logInfo(`filtro aplicado na busca (${variant.label}): ${effectiveTarget}`);
+        }
 
-      remainingLimit -= result.products.length;
+        if (hasExecutedSearch) {
+          logInfo(`aguardando ${MIN_DELAY_BETWEEN_SEARCHES_MS}ms antes da proxima busca`);
+          await sleep(MIN_DELAY_BETWEEN_SEARCHES_MS);
+        }
+
+        logInfo(`pesquisando (${variant.label}): ${effectiveTarget}`);
+        let result;
+
+        try {
+          result = await collectProductsFromTarget(effectiveTarget, cookies, remainingLimit, {
+            db,
+            affiliate: args.affiliate,
+            affiliateTag: args.affiliateTag,
+            maxPages: args.maxPages,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logError(`falha ao processar ${target} (${variant.label}): ${message}`);
+          throw error;
+        }
+
+        hasExecutedSearch = true;
+
+        results.push({
+          ...result,
+          category: group.category,
+          chatId: group.chatId,
+          requestedTarget: target,
+          effectiveTarget,
+          searchVariant: variant.label,
+        });
+
+        logInfo(`resultado (${variant.label}): ${result.discoveredProducts} produto(s) novos em ${result.type}`);
+        if (result.skippedDuplicates) {
+          logInfo(`duplicados ignorados (${variant.label}): ${result.skippedDuplicates}`);
+        }
+        for (const product of result.products) {
+          const summary = summarizeProduct(product);
+          const priceText = summary.price != null && summary.currency ? `${summary.currency} ${summary.price}` : 'sem preco';
+          const originalPriceText = summary.originalPrice != null && summary.currency ? ` | antes ${summary.currency} ${summary.originalPrice}` : '';
+          const affiliateText = summary.affiliateShortUrl || 'sem meli.la';
+          logInfo(`item ${summary.itemId || '-'} | ${summary.title || 'sem titulo'} | ${priceText}${originalPriceText} | ${affiliateText}`);
+        }
+
+        remainingLimit -= result.products.length;
+      }
     }
   }
 
-  const aggregatedProducts = results.flatMap((result) =>
-    result.products.map((product) => ({
-      ...product,
-      sourceRequestedTarget: result.requestedTarget,
-      sourceEffectiveTarget: result.effectiveTarget,
-      sourceSearchVariant: result.searchVariant,
-    }))
-  );
+  const categorizedPayloads = normalizedTargetGroups.map((group) => {
+    const groupResults = results.filter((result) => result.category === group.category);
+    const products = groupResults.flatMap((result) =>
+      result.products.map((product) => ({
+        ...product,
+        sourceRequestedTarget: result.requestedTarget,
+        sourceEffectiveTarget: result.effectiveTarget,
+        sourceSearchVariant: result.searchVariant,
+      }))
+    );
 
-  const totalNewProducts = aggregatedProducts.length;
+    return {
+      categoria: group.category,
+      chatid: group.chatId,
+      totalProducts: products.length,
+      products,
+      results: groupResults,
+    };
+  });
+
+  const totalNewProducts = categorizedPayloads.reduce((sum, group) => sum + group.totalProducts, 0);
   if (totalNewProducts === 0) {
     logWarn('nenhum produto novo encontrado; nada sera enviado ao webhook.');
     return;
@@ -1122,23 +1271,43 @@ async function main() {
     cookiesFile: args.cookies,
     dbFile: args.db,
     generatedAt: new Date().toISOString(),
+    totalCategories: categorizedPayloads.length,
     totalProducts: totalNewProducts,
-    products: aggregatedProducts,
+    categorias: categorizedPayloads,
     results,
   };
 
-  logInfo(`payload final do webhook: ${totalNewProducts} produto(s) em lista unica`);
+  logInfo(`payload final do webhook: ${totalNewProducts} produto(s) em ${categorizedPayloads.length} categoria(s)`);
 
-  const webhookResult = await sendToWebhook(args.webhook, output);
+  let lastWebhookStatus = null;
 
-  if (webhookResult.skipped) {
-    logWarn('webhook desabilitado, JSON nao enviado.');
-    return;
-  }
+  for (const categoryPayload of categorizedPayloads) {
+    const webhookPayload = {
+      ok: true,
+      cookiesFile: args.cookies,
+      dbFile: args.db,
+      generatedAt: output.generatedAt,
+      categoria: categoryPayload.categoria,
+      chatid: categoryPayload.chatid,
+      totalProducts: categoryPayload.totalProducts,
+      products: categoryPayload.products,
+      results: categoryPayload.results,
+    };
 
-  if (!webhookResult.ok) {
-    logError(`falha no webhook: HTTP ${webhookResult.status}${webhookResult.responseText ? ` | resposta: ${webhookResult.responseText}` : ''}`);
-    throw new Error(`Falha ao enviar para o webhook: HTTP ${webhookResult.status}`);
+    logInfo(`enviando webhook da categoria ${categoryPayload.categoria}: ${categoryPayload.totalProducts} produto(s)`);
+    const webhookResult = await sendToWebhook(args.webhook, webhookPayload);
+
+    if (webhookResult.skipped) {
+      logWarn('webhook desabilitado, JSON nao enviado.');
+      return;
+    }
+
+    if (!webhookResult.ok) {
+      logError(`falha no webhook: HTTP ${webhookResult.status}${webhookResult.responseText ? ` | resposta: ${webhookResult.responseText}` : ''}`);
+      throw new Error(`Falha ao enviar para o webhook: HTTP ${webhookResult.status}`);
+    }
+
+    lastWebhookStatus = webhookResult.status;
   }
 
   for (const result of results) {
@@ -1147,7 +1316,7 @@ async function main() {
     }
   }
 
-  logInfo(`webhook enviado com sucesso: HTTP ${webhookResult.status}`);
+  logInfo(`webhooks enviados com sucesso: ${categorizedPayloads.length} categoria(s) | ultimo status HTTP ${lastWebhookStatus}`);
   logInfo(`produtos marcados no sqlite: ${totalNewProducts}`);
 }
 
