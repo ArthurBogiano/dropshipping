@@ -8,6 +8,8 @@ const { DatabaseSync } = require('node:sqlite');
 const DEFAULT_WEBHOOK_URL = 'https://example.com/webhook';
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), 'mercadolivre-products.sqlite');
 const DEFAULT_MAX_PAGES = 5;
+const DEFAULT_FETCH_RETRY_DELAY_MS = 2000;
+const DEFAULT_FETCH_RETRIES = 2;
 const MIN_DELAY_BETWEEN_SEARCHES_MS = 1000;
 const SEARCH_PAGE_SIZE = 48;
 const PROMOTION_FILTERS = {
@@ -282,6 +284,10 @@ function sleep(ms) {
   });
 }
 
+function isRetryableStatus(status) {
+  return status === 403 || status === 408 || status === 429 || status >= 500;
+}
+
 function openDatabase(dbPath) {
   const db = new DatabaseSync(dbPath);
   db.exec(`
@@ -416,25 +422,38 @@ function buildCookieHeader(targetUrl, cookies) {
 }
 
 async function fetchHtml(url, cookies) {
-  const response = await fetch(url, {
-    redirect: 'follow',
-    headers: {
-      accept: 'text/html,application/xhtml+xml',
-      'accept-language': 'pt-BR,pt;q=0.9,en;q=0.8',
-      cookie: buildCookieHeader(url, cookies),
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-    },
-  });
+  let lastStatus = null;
 
-  if (!response.ok) {
-    throw new Error(`Falha ao buscar ${url}: HTTP ${response.status}`);
+  for (let attempt = 0; attempt <= DEFAULT_FETCH_RETRIES; attempt += 1) {
+    const response = await fetch(url, {
+      redirect: 'follow',
+      headers: {
+        accept: 'text/html,application/xhtml+xml',
+        'accept-language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        cookie: buildCookieHeader(url, cookies),
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+      },
+    });
+
+    if (response.ok) {
+      return {
+        html: await response.text(),
+        finalUrl: response.url,
+        status: response.status,
+      };
+    }
+
+    lastStatus = response.status;
+    if (attempt >= DEFAULT_FETCH_RETRIES || !isRetryableStatus(response.status)) {
+      throw new Error(`Falha ao buscar ${url}: HTTP ${response.status}`);
+    }
+
+    const retryDelayMs = DEFAULT_FETCH_RETRY_DELAY_MS * (attempt + 1);
+    logWarn(`falha temporaria ao buscar ${url}: HTTP ${response.status}; tentando novamente em ${retryDelayMs}ms`);
+    await sleep(retryDelayMs);
   }
 
-  return {
-    html: await response.text(),
-    finalUrl: response.url,
-    status: response.status,
-  };
+  throw new Error(`Falha ao buscar ${url}: HTTP ${lastStatus || 'desconhecido'}`);
 }
 
 function extractCsrfToken(html) {
@@ -978,7 +997,17 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
     for (let pageNumber = 1; pageNumber <= listingMaxPages && products.length < limit; pageNumber += 1) {
       const pageUrl = buildListingPageUrl(target, pageNumber);
       logInfo(`varrendo pagina ${pageNumber}/${listingMaxPages}: ${pageUrl}`);
-      const listing = await fetchHtml(pageUrl, cookies);
+      let listing;
+
+      try {
+        listing = await fetchHtml(pageUrl, cookies);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logWarn(`falha ao buscar a listagem ${pageUrl}; pagina ignorada: ${message}`);
+        pageStats.push({ page: pageNumber, pageUrl, found: 0, newProducts: 0, skippedDuplicates: 0, error: message });
+        continue;
+      }
+
       const productUrls = extractProductUrlsFromListing(listing.html, Math.max(limit * 4, 24));
 
       if (productUrls.length === 0) {
@@ -1001,14 +1030,24 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
           continue;
         }
 
-        const page = await fetchHtml(productUrl, cookies);
-        const canonicalUrl = extractCanonicalUrl(page.html) || page.finalUrl || productUrl;
-        const payloadBase = buildProductPayload({
-          requestedUrl: productUrl,
-          finalUrl: page.finalUrl,
-          html: page.html,
-          affiliate: null,
-        });
+        let page;
+        let canonicalUrl;
+        let payloadBase;
+
+        try {
+          page = await fetchHtml(productUrl, cookies);
+          canonicalUrl = extractCanonicalUrl(page.html) || page.finalUrl || productUrl;
+          payloadBase = buildProductPayload({
+            requestedUrl: productUrl,
+            finalUrl: page.finalUrl,
+            html: page.html,
+            affiliate: null,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logWarn(`falha ao buscar o produto ${productUrl}; item ignorado: ${message}`);
+          continue;
+        }
 
         const dedupeKey = buildDedupeKey(payloadBase);
         const alreadySent = db ? getSentProduct(db, dedupeKey) : null;
@@ -1032,7 +1071,7 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
           : null;
 
         if (affiliate && !affiliate.ok) {
-          logError(`falha ao gerar link afiliado para ${canonicalUrl}: ${affiliate.error || 'erro desconhecido'}`);
+          logWarn(`falha ao gerar link afiliado para ${canonicalUrl}: ${affiliate.error || 'erro desconhecido'}`);
         }
 
         payloadBase.affiliate = affiliate;
@@ -1209,7 +1248,7 @@ async function main() {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           logError(`falha ao processar ${target} (${variant.label}): ${message}`);
-          throw error;
+          continue;
         }
 
         hasExecutedSearch = true;
