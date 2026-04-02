@@ -8,9 +8,12 @@ const { DatabaseSync } = require('node:sqlite');
 const DEFAULT_WEBHOOK_URL = 'https://example.com/webhook';
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), 'mercadolivre-products.sqlite');
 const DEFAULT_MAX_PAGES = 5;
-const DEFAULT_FETCH_RETRY_DELAY_MS = 2000;
 const DEFAULT_FETCH_RETRIES = 2;
-const MIN_DELAY_BETWEEN_SEARCHES_MS = 1000;
+const MAX_CONSECUTIVE_LISTING_FAILURES = 2;
+const LISTING_REQUEST_DELAY_MIN_MS = 3 * 60 * 1000;
+const LISTING_REQUEST_DELAY_MAX_MS = 5 * 60 * 1000;
+const PRODUCT_REQUEST_DELAY_MIN_MS = 5 * 1000;
+const PRODUCT_REQUEST_DELAY_MAX_MS = 10 * 1000;
 const SEARCH_PAGE_SIZE = 48;
 const PROMOTION_FILTERS = {
   deal_of_the_day: {
@@ -284,8 +287,48 @@ function sleep(ms) {
   });
 }
 
+function randomIntInclusive(min, max) {
+  const normalizedMin = Math.ceil(min);
+  const normalizedMax = Math.floor(max);
+  return Math.floor(Math.random() * (normalizedMax - normalizedMin + 1)) + normalizedMin;
+}
+
+let hasMadeNetworkRequest = false;
+
+function getDelayRange(profile) {
+  if (profile === 'product') {
+    return {
+      min: PRODUCT_REQUEST_DELAY_MIN_MS,
+      max: PRODUCT_REQUEST_DELAY_MAX_MS,
+    };
+  }
+
+  return {
+    min: LISTING_REQUEST_DELAY_MIN_MS,
+    max: LISTING_REQUEST_DELAY_MAX_MS,
+  };
+}
+
+async function throttledFetch(url, options, label = 'requisicao', profile = 'listing') {
+  if (hasMadeNetworkRequest) {
+    const delayRange = getDelayRange(profile);
+    const delayMs = randomIntInclusive(delayRange.min, delayRange.max);
+    logInfo(`aguardando ${delayMs}ms antes da ${label}: ${url}`);
+    await sleep(delayMs);
+  }
+
+  hasMadeNetworkRequest = true;
+  return fetch(url, options);
+}
+
 function isRetryableStatus(status) {
   return status === 403 || status === 408 || status === 429 || status >= 500;
+}
+
+function extractHttpStatusFromError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const matchedStatus = message.match(/HTTP\s+(\d+)/i);
+  return matchedStatus ? Number.parseInt(matchedStatus[1], 10) : null;
 }
 
 function openDatabase(dbPath) {
@@ -421,11 +464,13 @@ function buildCookieHeader(targetUrl, cookies) {
     .join('; ');
 }
 
-async function fetchHtml(url, cookies) {
+async function fetchHtml(url, cookies, options = {}) {
+  const profile = options.profile || 'listing';
+  const label = options.label || 'busca HTTP';
   let lastStatus = null;
 
   for (let attempt = 0; attempt <= DEFAULT_FETCH_RETRIES; attempt += 1) {
-    const response = await fetch(url, {
+    const response = await throttledFetch(url, {
       redirect: 'follow',
       headers: {
         accept: 'text/html,application/xhtml+xml',
@@ -433,7 +478,7 @@ async function fetchHtml(url, cookies) {
         cookie: buildCookieHeader(url, cookies),
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
       },
-    });
+    }, label, profile);
 
     if (response.ok) {
       return {
@@ -448,9 +493,7 @@ async function fetchHtml(url, cookies) {
       throw new Error(`Falha ao buscar ${url}: HTTP ${response.status}`);
     }
 
-    const retryDelayMs = DEFAULT_FETCH_RETRY_DELAY_MS * (attempt + 1);
-    logWarn(`falha temporaria ao buscar ${url}: HTTP ${response.status}; tentando novamente em ${retryDelayMs}ms`);
-    await sleep(retryDelayMs);
+    logWarn(`falha temporaria ao buscar ${url}: HTTP ${response.status}; nova tentativa sera feita respeitando o delay aleatorio global`);
   }
 
   throw new Error(`Falha ao buscar ${url}: HTTP ${lastStatus || 'desconhecido'}`);
@@ -482,7 +525,7 @@ async function createAffiliateLink({ url, referer, html, cookies, affiliateTag }
   }
 
   const endpoint = 'https://www.mercadolivre.com.br/affiliate-program/api/v2/stripe/user/links';
-  const response = await fetch(endpoint, {
+  const response = await throttledFetch(endpoint, {
     method: 'POST',
     headers: {
       accept: 'application/json, text/plain, */*',
@@ -498,7 +541,7 @@ async function createAffiliateLink({ url, referer, html, cookies, affiliateTag }
       url,
       tag: affiliateTag,
     }),
-  });
+  }, 'geracao de link afiliado', 'product');
 
   const rawText = await response.text();
   let data = null;
@@ -562,6 +605,15 @@ async function sendToWebhook(webhookUrl, payload) {
     skipped: false,
     status: response.status,
     responseText: text,
+  };
+}
+
+function buildWebhookPayloadBase(args) {
+  return {
+    ok: true,
+    cookiesFile: args.cookies,
+    dbFile: args.db,
+    generatedAt: new Date().toISOString(),
   };
 }
 
@@ -992,6 +1044,7 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
     const products = [];
     const pageStats = [];
     const seenInRun = new Set();
+    let consecutiveListingFailures = 0;
     let skippedDuplicates = 0;
 
     for (let pageNumber = 1; pageNumber <= listingMaxPages && products.length < limit; pageNumber += 1) {
@@ -1000,13 +1053,31 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
       let listing;
 
       try {
-        listing = await fetchHtml(pageUrl, cookies);
+        listing = await fetchHtml(pageUrl, cookies, {
+          profile: 'listing',
+          label: 'busca de listagem',
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const status = extractHttpStatusFromError(error);
+        consecutiveListingFailures += 1;
         logWarn(`falha ao buscar a listagem ${pageUrl}; pagina ignorada: ${message}`);
-        pageStats.push({ page: pageNumber, pageUrl, found: 0, newProducts: 0, skippedDuplicates: 0, error: message });
+        pageStats.push({ page: pageNumber, pageUrl, found: 0, newProducts: 0, skippedDuplicates: 0, error: message, status });
+
+        if (status === 403 && pageNumber === 1) {
+          logWarn(`listagem bloqueada ja na primeira pagina; interrompendo a variante atual para ${target}`);
+          break;
+        }
+
+        if (consecutiveListingFailures >= MAX_CONSECUTIVE_LISTING_FAILURES) {
+          logWarn(`atingido o limite de ${MAX_CONSECUTIVE_LISTING_FAILURES} falhas consecutivas na listagem; interrompendo a paginacao de ${target}`);
+          break;
+        }
+
         continue;
       }
+
+      consecutiveListingFailures = 0;
 
       const productUrls = extractProductUrlsFromListing(listing.html, Math.max(limit * 4, 24));
 
@@ -1035,7 +1106,10 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
         let payloadBase;
 
         try {
-          page = await fetchHtml(productUrl, cookies);
+          page = await fetchHtml(productUrl, cookies, {
+            profile: 'product',
+            label: 'busca de produto',
+          });
           canonicalUrl = extractCanonicalUrl(page.html) || page.finalUrl || productUrl;
           payloadBase = buildProductPayload({
             requestedUrl: productUrl,
@@ -1106,7 +1180,10 @@ async function collectProductsFromTarget(target, cookies, limit, options = {}) {
     };
   }
 
-  const page = await fetchHtml(target, cookies);
+  const page = await fetchHtml(target, cookies, {
+    profile: 'product',
+    label: 'busca de produto',
+  });
   const canonicalUrl = extractCanonicalUrl(page.html) || page.finalUrl || target;
   const payloadBase = buildProductPayload({ requestedUrl: target, finalUrl: page.finalUrl, html: page.html, affiliate: null });
   const dedupeKey = buildDedupeKey(payloadBase);
@@ -1188,7 +1265,10 @@ async function main() {
 
   const cookies = readCookies(args.cookies);
   const db = openDatabase(args.db);
-  const results = [];
+  const allResults = [];
+  let totalWebhooksSent = 0;
+  let totalProductsSent = 0;
+  let lastWebhookStatus = null;
 
   logInfo(`cookies carregados: ${path.basename(args.cookies)}`);
   logInfo(`sqlite: ${args.db}`);
@@ -1202,21 +1282,15 @@ async function main() {
   logInfo(`destino do webhook: ${args.webhook || 'desabilitado'}`);
 
   const searchVariants = getSearchVariants(args);
-  let hasExecutedSearch = false;
 
   for (const group of normalizedTargetGroups) {
     logInfo(`categoria atual: ${group.category}${group.chatId ? ` | chatid ${group.chatId}` : ''}`);
 
     for (const target of group.targets) {
+      const targetResults = [];
       const seenTargets = new Set();
-      let remainingLimit = args.limit;
 
       for (const variant of searchVariants) {
-        if (remainingLimit <= 0) {
-          logInfo(`limite total atingido para ${target}: ${args.limit} produto(s)`);
-          break;
-        }
-
         const effectiveTarget = applyListingSearchParams(target, {
           promotionType: variant.promotionType,
         });
@@ -1230,16 +1304,11 @@ async function main() {
           logInfo(`filtro aplicado na busca (${variant.label}): ${effectiveTarget}`);
         }
 
-        if (hasExecutedSearch) {
-          logInfo(`aguardando ${MIN_DELAY_BETWEEN_SEARCHES_MS}ms antes da proxima busca`);
-          await sleep(MIN_DELAY_BETWEEN_SEARCHES_MS);
-        }
-
         logInfo(`pesquisando (${variant.label}): ${effectiveTarget}`);
         let result;
 
         try {
-          result = await collectProductsFromTarget(effectiveTarget, cookies, remainingLimit, {
+          result = await collectProductsFromTarget(effectiveTarget, cookies, args.limit, {
             db,
             affiliate: args.affiliate,
             affiliateTag: args.affiliateTag,
@@ -1251,16 +1320,17 @@ async function main() {
           continue;
         }
 
-        hasExecutedSearch = true;
-
-        results.push({
+        const enrichedResult = {
           ...result,
           category: group.category,
           chatId: group.chatId,
           requestedTarget: target,
           effectiveTarget,
           searchVariant: variant.label,
-        });
+        };
+
+        targetResults.push(enrichedResult);
+        allResults.push(enrichedResult);
 
         logInfo(`resultado (${variant.label}): ${result.discoveredProducts} produto(s) novos em ${result.type}`);
         if (result.skippedDuplicates) {
@@ -1273,90 +1343,60 @@ async function main() {
           const affiliateText = summary.affiliateShortUrl || 'sem meli.la';
           logInfo(`item ${summary.itemId || '-'} | ${summary.title || 'sem titulo'} | ${priceText}${originalPriceText} | ${affiliateText}`);
         }
-
-        remainingLimit -= result.products.length;
       }
+
+      const targetProducts = targetResults.flatMap((result) =>
+        result.products.map((product) => ({
+          ...product,
+          sourceRequestedTarget: result.requestedTarget,
+          sourceEffectiveTarget: result.effectiveTarget,
+          sourceSearchVariant: result.searchVariant,
+        }))
+      );
+
+      const webhookPayload = {
+        ...buildWebhookPayloadBase(args),
+        categoria: group.category,
+        chatid: group.chatId,
+        requestedTarget: target,
+        totalProducts: targetProducts.length,
+        products: targetProducts,
+        results: targetResults,
+      };
+
+      logInfo(`payload do webhook para ${target}: ${targetProducts.length} produto(s) somando ${searchVariants.length} variante(s)`);
+
+      const webhookResult = await sendToWebhook(args.webhook, webhookPayload);
+
+      if (webhookResult.skipped) {
+        logWarn('webhook desabilitado, JSON nao enviado.');
+        return;
+      }
+
+      if (!webhookResult.ok) {
+        logError(`falha no webhook: HTTP ${webhookResult.status}${webhookResult.responseText ? ` | resposta: ${webhookResult.responseText}` : ''}`);
+        throw new Error(`Falha ao enviar para o webhook: HTTP ${webhookResult.status}`);
+      }
+
+      for (const result of targetResults) {
+        for (const product of result.products) {
+          markProductSent(db, product, result.target, args.webhook);
+        }
+      }
+      lastWebhookStatus = webhookResult.status;
+      totalWebhooksSent += 1;
+      totalProductsSent += targetProducts.length;
+      logInfo(`webhook enviado com sucesso para ${target}: HTTP ${webhookResult.status}`);
     }
   }
 
-  const categorizedPayloads = normalizedTargetGroups.map((group) => {
-    const groupResults = results.filter((result) => result.category === group.category);
-    const products = groupResults.flatMap((result) =>
-      result.products.map((product) => ({
-        ...product,
-        sourceRequestedTarget: result.requestedTarget,
-        sourceEffectiveTarget: result.effectiveTarget,
-        sourceSearchVariant: result.searchVariant,
-      }))
-    );
-
-    return {
-      categoria: group.category,
-      chatid: group.chatId,
-      totalProducts: products.length,
-      products,
-      results: groupResults,
-    };
-  });
-
-  const totalNewProducts = categorizedPayloads.reduce((sum, group) => sum + group.totalProducts, 0);
-  if (totalNewProducts === 0) {
-    logWarn('nenhum produto novo encontrado; nada sera enviado ao webhook.');
+  if (allResults.length === 0) {
+    logWarn('nenhuma busca retornou resultado; nada foi processado.');
     return;
   }
 
-  const output = {
-    ok: true,
-    cookiesFile: args.cookies,
-    dbFile: args.db,
-    generatedAt: new Date().toISOString(),
-    totalCategories: categorizedPayloads.length,
-    totalProducts: totalNewProducts,
-    categorias: categorizedPayloads,
-    results,
-  };
-
-  logInfo(`payload final do webhook: ${totalNewProducts} produto(s) em ${categorizedPayloads.length} categoria(s)`);
-
-  let lastWebhookStatus = null;
-
-  for (const categoryPayload of categorizedPayloads) {
-    const webhookPayload = {
-      ok: true,
-      cookiesFile: args.cookies,
-      dbFile: args.db,
-      generatedAt: output.generatedAt,
-      categoria: categoryPayload.categoria,
-      chatid: categoryPayload.chatid,
-      totalProducts: categoryPayload.totalProducts,
-      products: categoryPayload.products,
-      results: categoryPayload.results,
-    };
-
-    logInfo(`enviando webhook da categoria ${categoryPayload.categoria}: ${categoryPayload.totalProducts} produto(s)`);
-    const webhookResult = await sendToWebhook(args.webhook, webhookPayload);
-
-    if (webhookResult.skipped) {
-      logWarn('webhook desabilitado, JSON nao enviado.');
-      return;
-    }
-
-    if (!webhookResult.ok) {
-      logError(`falha no webhook: HTTP ${webhookResult.status}${webhookResult.responseText ? ` | resposta: ${webhookResult.responseText}` : ''}`);
-      throw new Error(`Falha ao enviar para o webhook: HTTP ${webhookResult.status}`);
-    }
-
-    lastWebhookStatus = webhookResult.status;
-  }
-
-  for (const result of results) {
-    for (const product of result.products) {
-      markProductSent(db, product, result.target, args.webhook);
-    }
-  }
-
-  logInfo(`webhooks enviados com sucesso: ${categorizedPayloads.length} categoria(s) | ultimo status HTTP ${lastWebhookStatus}`);
-  logInfo(`produtos marcados no sqlite: ${totalNewProducts}`);
+  logInfo(`webhooks enviados com sucesso: ${totalWebhooksSent} target(s) | ultimo status HTTP ${lastWebhookStatus}`);
+  logInfo(`produtos marcados no sqlite: ${totalProductsSent}`);
 }
 
 main().catch((error) => {
