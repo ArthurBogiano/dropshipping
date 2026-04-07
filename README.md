@@ -381,6 +381,8 @@ Se quiser começar pelo código, o ponto de entrada é [fetch-mercadolivre-produ
 
 O script agora roda em loop continuo por padrao, pensado para uso com `pm2`. Ao concluir um ciclo completo da lista de targets, ele espera `60000ms` e reinicia automaticamente.
 
+No modo servico, o loop tambem entra em pausa automaticamente entre `22:00` e `07:00`, usando o horario local da maquina onde o processo estiver rodando. Se o processo iniciar dentro dessa janela, ele aguarda ate `07:00` antes de comecar um novo ciclo.
+
 Use `--no-loop` quando quiser executar apenas uma vez e encerrar.
 
 Tambem foi adicionada a opcao `--loop-delay-ms <n>` para controlar o intervalo entre ciclos.
