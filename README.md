@@ -11,7 +11,7 @@ Script em Node.js para coletar produtos do Mercado Livre a partir de URLs de pro
   - `Oferta do dia`
   - `Oferta relâmpago`
 - Gera links de afiliado via API do Mercado Livre.
-- Deduplica produtos já enviados usando SQLite.
+- Deduplica produtos já enviados usando SQLite, com janela mínima para reenvio.
 - Envia o payload final para um webhook.
 - Respeita delays aleatórios entre requisições para reduzir bloqueios.
 
@@ -59,7 +59,7 @@ Para cada target, ele:
 3. Descobre os produtos da listagem, quando aplicável.
 4. Extrai os dados estruturados do produto.
 5. Tenta gerar o link de afiliado.
-6. Ignora itens já enviados anteriormente com base em uma chave de deduplicação.
+6. Ignora itens enviados dentro da janela mínima de reenvio com base em uma chave de deduplicação.
 7. Monta um payload JSON.
 8. Envia o resultado para um webhook.
 9. Marca os produtos enviados no banco SQLite.
@@ -116,6 +116,7 @@ node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB123456
 | `--targets-file <arquivo>` | Arquivo JSON com categorias, chatid e URLs |
 | `--limit <n>` | Limite de produtos extraídos por listagem |
 | `--max-pages <n>` | Máximo de páginas extras buscadas em listagens/ofertas |
+| `--resend-after-hours <n>` | Horas mínimas para a mesma oferta poder ser enviada de novo |
 | `--compact` | Desliga a identação do JSON |
 | `--affiliate-tag <tag>` | Força a tag de afiliado usada na API |
 | `--deal-of-day` | Ativa busca por Oferta do dia |
@@ -199,6 +200,7 @@ Campos principais:
 - `source_target`
 - `webhook_url`
 - `first_sent_at`
+- `last_sent_at`
 - `last_seen_at`
 
 Regra de deduplicação:
@@ -207,6 +209,8 @@ Regra de deduplicação:
   - `itemId`
   - `canonicalUrl`
   - `requestedUrl`
+- O reenvio só é liberado depois da janela configurada em `--resend-after-hours`.
+- O valor padrão atual é `48` horas.
 
 ## Payload enviado ao webhook
 
