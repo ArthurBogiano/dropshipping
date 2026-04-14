@@ -113,7 +113,7 @@ node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB123456
 | `-h`, `--help` | Exibe a ajuda do script |
 | `--cookies <arquivo>` | Caminho do arquivo de cookies JSON |
 | `--db <arquivo>` | Caminho do banco SQLite |
-| `--targets-file <arquivo>` | Arquivo JSON com categorias, chatid e URLs |
+| `--targets-file <arquivo>` | Arquivo JSON com categorias, `chatid` em array e URLs |
 | `--limit <n>` | Limite de produtos extraídos por listagem |
 | `--max-pages <n>` | Máximo de páginas extras buscadas em listagens/ofertas |
 | `--resend-after-hours <n>` | Horas mínimas para a mesma oferta poder ser enviada de novo |
@@ -160,13 +160,17 @@ O projeto aceita diferentes formatos, mas o formato atual usado no repositório 
 ```json
 {
   "fitness": {
-    "chatid": "replace-with-destination-id",
+    "chatid": [
+      "replace-with-destination-id"
+    ],
     "targets": [
       "https://lista.mercadolivre.com.br/saude/suplementos-alimentares/"
     ]
   },
   "pets": {
-    "chatid": "replace-with-destination-id",
+    "chatid": [
+      "replace-with-destination-id"
+    ],
     "targets": [
       "https://www.mercadolivre.com.br/c/animais"
     ]
@@ -176,7 +180,7 @@ O projeto aceita diferentes formatos, mas o formato atual usado no repositório 
 
 Cada grupo contém:
 
-- `chatid`: identificador que segue junto no payload.
+- `chatid`: array de identificadores que segue junto no payload.
 - `targets`: lista de URLs que serão processadas.
 
 Também são aceitas chaves alternativas como `urls`, `links` e `lista`.
@@ -223,7 +227,9 @@ O payload base enviado para cada target contém:
   "dbFile": "caminho/do/sqlite",
   "generatedAt": "2026-04-02T00:00:00.000Z",
   "categoria": "fitness",
-  "chatid": "replace-with-destination-id",
+  "chatid": [
+    "replace-with-destination-id"
+  ],
   "requestedTarget": "https://lista.mercadolivre.com.br/...",
   "totalProducts": 3,
   "products": [],
