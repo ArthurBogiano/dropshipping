@@ -1,0 +1,13 @@
+[
+  {
+    "domain": ".mercadolivre.com.br",
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "replace-with-cookie-name",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": true,
+    "value": "replace-with-cookie-value"
+  }
+]

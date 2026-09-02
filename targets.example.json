@@ -1,0 +1,17 @@
+{
+  "tecnologia": {
+    "chatid": [
+      "replace-with-destination-id"
+    ],
+    "targets": [
+      "https://lista.mercadolivre.com.br/notebook",
+      "https://www.mercadolivre.com.br/ofertas"
+    ]
+  },
+  "casa": {
+    "chatid": [],
+    "targets": [
+      "https://lista.mercadolivre.com.br/casa-e-decoracao"
+    ]
+  }
+}

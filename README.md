@@ -1,412 +1,195 @@
-# Dropshipping Mercado Livre
+# Mercado Livre Offer Collector
 
-Script em Node.js para coletar produtos do Mercado Livre a partir de URLs de produto, listagens, páginas de ofertas e categorias, gerar links de afiliado `meli.la`, evitar reenvios duplicados com SQLite e enviar o resultado para um webhook.
+[![CI](https://github.com/ArthurBogiano/dropshipping/actions/workflows/ci.yml/badge.svg)](https://github.com/ArthurBogiano/dropshipping/actions/workflows/ci.yml)
+[![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## O que este projeto faz
+Coletor e automatizador em Node.js para descobrir ofertas do Mercado Livre, extrair dados estruturados de produtos, gerar links de afiliado e entregar os resultados a um webhook.
 
-- Extrai dados completos de produtos do Mercado Livre.
-- Aceita uma URL única ou várias URLs por linha de comando.
-- Lê grupos de categorias a partir de um arquivo `JSON`.
-- Suporta buscas promocionais com:
-  - `Oferta do dia`
-  - `Oferta relâmpago`
-- Gera links de afiliado via API do Mercado Livre.
-- Deduplica produtos já enviados usando SQLite, com janela mínima para reenvio.
-- Envia o payload final para um webhook.
-- Respeita delays aleatórios entre requisições para reduzir bloqueios.
+O projeto não possui dependências de produção: usa APIs nativas do Node.js, incluindo `fetch`, `worker_threads` e `node:sqlite`.
 
-## Estrutura do projeto
+> Este é um projeto independente e não oficial. Ele não é afiliado, patrocinado ou mantido pelo Mercado Livre. Use-o de forma responsável e respeite os termos, limites e políticas da plataforma.
 
-```text
-.
-├─ fetch-mercadolivre-products.js   # Script principal
-├─ targets.json                     # Exemplo/configuração de categorias e URLs
-├─ cookies.json                     # Cookies exportados do navegador
-├─ mercadolivre-products.sqlite     # Banco local para deduplicação
-└─ .gitignore
-```
+## Recursos
+
+- Coleta URLs de produto, páginas de busca, categorias e ofertas.
+- Processa grupos de categorias em workers separados.
+- Serializa as requisições de rede entre workers e aplica intervalos configuráveis.
+- Lê dados de produto em JSON-LD e complementa com informações da página.
+- Tenta gerar links curtos pelo programa de afiliados quando há credenciais válidas.
+- Evita reenvios com deduplicação persistida em SQLite.
+- Suporta execução única ou serviço contínuo com horário de silêncio.
+- Envia um payload JSON a qualquer webhook ou imprime o resultado localmente.
+- Mantém cookies, destinos, banco e variáveis locais fora do Git.
 
 ## Requisitos
 
-- Node.js `22+`
-  - O projeto usa `node:sqlite`, disponível nas versões recentes do Node.
-- Acesso à internet
-- Um arquivo `cookies.json` válido exportado do navegador
+- Node.js 22.5 ou mais recente.
+- Uma conta e cookies válidos do Mercado Livre apenas para os recursos que exigirem autenticação.
+- Acesso à internet.
 
-## Instalação
-
-Como o projeto usa apenas módulos nativos do Node, não há `package.json` nem dependências externas para instalar.
-
-1. Clone ou copie este repositório.
-2. Instale o Node.js `22` ou superior.
-3. Coloque seu arquivo de cookies em `cookies.json` na raiz do projeto.
-4. Ajuste o `targets.json` se quiser trabalhar com múltiplas categorias.
-
-Para validar se o Node está disponível:
+## Início rápido
 
 ```bash
-node --version
+git clone https://github.com/ArthurBogiano/dropshipping.git
+cd dropshipping
+npm install
 ```
 
-## Como funciona
-
-O script recebe targets por linha de comando ou por `--targets-file`.
-
-Para cada target, ele:
-
-1. Identifica se a URL é de produto ou de listagem/categoria/ofertas.
-2. Busca a página HTML usando os cookies informados.
-3. Descobre os produtos da listagem, quando aplicável.
-4. Extrai os dados estruturados do produto.
-5. Tenta gerar o link de afiliado.
-6. Ignora itens enviados dentro da janela mínima de reenvio com base em uma chave de deduplicação.
-7. Monta um payload JSON.
-8. Envia o resultado para um webhook.
-9. Marca os produtos enviados no banco SQLite.
-
-## Uso básico
-
-### 1. Processar uma página de produto
+Crie as configurações locais a partir dos exemplos:
 
 ```bash
-node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB12345678"
+cp .env.example .env
+cp cookies.example.json cookies.json
+cp targets.example.json targets.json
 ```
 
-### 2. Processar uma listagem
+No PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+Copy-Item cookies.example.json cookies.json
+Copy-Item targets.example.json targets.json
+```
+
+Edite os três arquivos copiados. Os arquivos reais `.env`, `cookies.json` e `targets.json` são ignorados pelo Git.
+
+Para executar uma única coleta sem enviar dados a terceiros:
 
 ```bash
-node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/notebook" --limit 3
+node fetch-mercadolivre-products.js --targets-file targets.json --no-webhook --no-loop
 ```
 
-### 3. Processar múltiplas categorias via arquivo
+## Configuração
 
-```bash
-node fetch-mercadolivre-products.js --targets-file targets.json --limit 5
-```
+A aplicação carrega `.env` automaticamente. Variáveis já definidas no ambiente têm prioridade. Consulte [`.env.example`](.env.example) para ver todos os valores disponíveis.
 
-### 4. Buscar promoções
+| Variável | Padrão | Finalidade |
+| --- | --- | --- |
+| `WEBHOOK_URL` | desabilitado | Destino HTTP do payload final |
+| `COOKIES_FILE` | `cookies.json` | Arquivo local de cookies |
+| `TARGETS_FILE` | não definido | Arquivo local de categorias e URLs |
+| `DB_FILE` | `mercadolivre-products.sqlite` | Banco local de deduplicação |
+| `AFFILIATE_TAG` | cookie `orgnickp` | Tag usada na geração de link afiliado |
+| `PRODUCT_LIMIT` | `5` | Produtos novos por busca |
+| `MAX_PAGES` | `5` | Páginas examinadas por listagem |
+| `REQUEST_TIMEOUT_MS` | `30000` | Timeout de cada requisição HTTP |
+| `RESEND_AFTER_HOURS` | `48` | Janela mínima antes de reenviar um item |
+| `LOOP_ENABLED` | `true` | Ativa o serviço contínuo |
+| `LOOP_DELAY_MS` | `60000` | Intervalo entre ciclos |
+| `QUIET_HOURS_ENABLED` | `true` | Ativa a pausa por horário |
+| `QUIET_HOURS_START` / `END` | `22` / `7` | Início e fim do horário de silêncio |
+| `QUIET_HOURS_TIMEZONE` | `America/Sao_Paulo` | Fuso IANA usado no agendamento |
 
-```bash
-node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/saude/suplementos-alimentares" --deal-of-day --limit 10
-```
+Os delays de listagem/produto e as tentativas HTTP também podem ser alterados no `.env.example`.
 
-```bash
-node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/saude/suplementos-alimentares" --lightning --limit 10
-```
+### Cookies
 
-### 5. Desabilitar webhook
-
-```bash
-node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/notebook" --no-webhook
-```
-
-### 6. Desabilitar link de afiliado
-
-```bash
-node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB12345678" --no-affiliate
-```
-
-## Opções disponíveis
-
-| Opção | Descrição |
-| --- | --- |
-| `-h`, `--help` | Exibe a ajuda do script |
-| `--cookies <arquivo>` | Caminho do arquivo de cookies JSON |
-| `--db <arquivo>` | Caminho do banco SQLite |
-| `--targets-file <arquivo>` | Arquivo JSON com categorias, `chatid` em array e URLs |
-| `--limit <n>` | Limite de produtos extraídos por listagem |
-| `--max-pages <n>` | Máximo de páginas extras buscadas em listagens/ofertas |
-| `--resend-after-hours <n>` | Horas mínimas para a mesma oferta poder ser enviada de novo |
-| `--compact` | Desliga a identação do JSON |
-| `--affiliate-tag <tag>` | Força a tag de afiliado usada na API |
-| `--deal-of-day` | Ativa busca por Oferta do dia |
-| `--lightning` | Ativa busca por Oferta relâmpago |
-| `--webhook <url>` | Define um webhook customizado |
-| `--no-webhook` | Não envia o JSON para webhook |
-| `--no-affiliate` | Não gera link `meli.la` |
-
-## Arquivo de cookies
-
-O script espera que `cookies.json` seja um array JSON, normalmente exportado por alguma extensão de navegador.
-
-Exemplo simplificado:
+Exporte os cookies do navegador como um array JSON e salve em `cookies.json`. A estrutura esperada está em [`cookies.example.json`](cookies.example.json).
 
 ```json
 [
   {
     "domain": ".mercadolivre.com.br",
-    "hostOnly": false,
-    "httpOnly": false,
-    "name": "orgnickp",
+    "name": "replace-with-cookie-name",
     "path": "/",
-    "sameSite": "no_restriction",
     "secure": true,
-    "session": false,
-    "value": "sua_tag"
+    "session": true,
+    "value": "replace-with-cookie-value"
   }
 ]
 ```
 
-Observações:
+Cookies expirados ou incompatíveis com o domínio, caminho e protocolo da URL não são enviados. Trate esse arquivo como uma credencial: não compartilhe nem faça commit.
 
-- Cookies expirados são ignorados.
-- Apenas cookies compatíveis com domínio/path da URL são enviados.
-- Se o cookie `orgnickp` existir, ele pode ser usado como tag de afiliado padrão.
+### Targets
 
-## Arquivo `targets.json`
-
-O projeto aceita diferentes formatos, mas o formato atual usado no repositório é este:
+Cada grupo de `targets.json` define uma categoria, uma lista opcional de destinos e uma lista de URLs:
 
 ```json
 {
-  "fitness": {
-    "chatid": [
-      "replace-with-destination-id"
-    ],
-    "targets": [
-      "https://lista.mercadolivre.com.br/saude/suplementos-alimentares/"
-    ]
-  },
-  "pets": {
-    "chatid": [
-      "replace-with-destination-id"
-    ],
-    "targets": [
-      "https://www.mercadolivre.com.br/c/animais"
-    ]
+  "tecnologia": {
+    "chatid": ["replace-with-destination-id"],
+    "targets": ["https://lista.mercadolivre.com.br/notebook"]
   }
 }
 ```
 
-Cada grupo contém:
+Veja [`targets.example.json`](targets.example.json) para um exemplo completo. Também são aceitas as chaves `urls`, `links` ou `lista` no lugar de `targets`.
 
-- `chatid`: array de identificadores que segue junto no payload.
-- `targets`: lista de URLs que serão processadas.
+## Uso
 
-Também são aceitas chaves alternativas como `urls`, `links` e `lista`.
+```bash
+# Uma URL de produto
+node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB12345678" --no-loop
 
-## Banco SQLite
+# Uma listagem, limitada a três produtos
+node fetch-mercadolivre-products.js "https://lista.mercadolivre.com.br/notebook" --limit 3 --no-loop
 
-O arquivo padrão é `mercadolivre-products.sqlite`.
+# Grupos definidos em arquivo
+node fetch-mercadolivre-products.js --targets-file targets.json --limit 5
 
-Ele é usado para registrar produtos já enviados e evitar duplicação entre execuções.
+# Ofertas do dia e relâmpago
+node fetch-mercadolivre-products.js --targets-file targets.json --deal-of-day --lightning
 
-Tabela criada automaticamente:
+# Saída local compacta, sem webhook ou link afiliado
+node fetch-mercadolivre-products.js --targets-file targets.json --no-webhook --no-affiliate --compact --no-loop
+```
 
-- `sent_products`
+Use `node fetch-mercadolivre-products.js --help` para consultar todas as opções. Argumentos de linha de comando substituem os padrões do ambiente.
 
-Campos principais:
+## Payload
 
-- `dedupe_key`
-- `item_id`
-- `canonical_url`
-- `title`
-- `source_target`
-- `webhook_url`
-- `first_sent_at`
-- `last_sent_at`
-- `last_seen_at`
-
-Regra de deduplicação:
-
-- O script usa, nesta ordem:
-  - `itemId`
-  - `canonicalUrl`
-  - `requestedUrl`
-- O reenvio só é liberado depois da janela configurada em `--resend-after-hours`.
-- O valor padrão atual é `48` horas.
-
-## Payload enviado ao webhook
-
-O payload base enviado para cada target contém:
+O webhook recebe um objeto por target. Caminhos locais e cookies nunca são incluídos:
 
 ```json
 {
   "ok": true,
-  "cookiesFile": "caminho/do/cookies.json",
-  "dbFile": "caminho/do/sqlite",
-  "generatedAt": "2026-04-02T00:00:00.000Z",
-  "categoria": "fitness",
-  "chatid": [
-    "replace-with-destination-id"
-  ],
-  "requestedTarget": "https://lista.mercadolivre.com.br/...",
-  "totalProducts": 3,
+  "schemaVersion": 1,
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "categoria": "tecnologia",
+  "chatid": ["replace-with-destination-id"],
+  "requestedTarget": "https://lista.mercadolivre.com.br/notebook",
+  "totalProducts": 1,
   "products": [],
   "results": []
 }
 ```
 
-Cada produto pode incluir informações como:
+Os produtos podem conter identificação, título, descrição, preço, imagens, especificações, vendedor, estoque, avaliação, frete e dados do link afiliado.
 
-- `itemId`
-- `title`
-- `description`
-- `canonicalUrl`
-- `price.amount`
-- `price.originalAmount`
-- `price.currency`
-- `price.installments`
-- `price.shipping`
-- `images`
-- `highlightedFeatures`
-- `specifications`
-- `seller`
-- `affiliate`
-- `stock`
-- `rating`
-- `reviewsPreview`
-- `breadcrumbs`
-
-## Webhook
-
-Por padrão, o script envia para:
+## Arquitetura
 
 ```text
-https://example.com/webhook
+CLI / .env / JSON
+        |
+        v
+orquestrador principal
+        |
+        +-- worker por categoria
+              |
+              +-- fila global de rede
+              +-- parser de listagem e produto
+              +-- gerador de link afiliado
+              +-- deduplicação SQLite
+              +-- webhook ou saída padrão
 ```
 
-Você pode trocar isso com:
+O banco cria as tabelas `sent_products` e `webhook_deliveries`. Arquivos `*.sqlite`, `*.db` e seus auxiliares são sempre ignorados pelo Git.
+
+## Desenvolvimento
 
 ```bash
-node fetch-mercadolivre-products.js --targets-file targets.json --webhook "https://seu-endpoint.com/webhook"
+npm run check
+npm test
+npm run audit:public
+npm run ci
 ```
 
-Se quiser apenas testar a coleta sem envio:
+Os testes usam apenas o runner nativo `node:test`. O workflow de CI executa a suíte nas versões 22 e 24 do Node.js.
 
-```bash
-node fetch-mercadolivre-products.js --targets-file targets.json --no-webhook
-```
+Leia [CONTRIBUTING.md](CONTRIBUTING.md) antes de enviar alterações e [SECURITY.md](SECURITY.md) para relatar vulnerabilidades ou exposição de credenciais.
 
-## Comportamento de rede
+## Licença
 
-O script aplica atrasos aleatórios entre requisições:
-
-- Listagens: entre `3` e `5` minutos
-- Produtos: entre `5` e `10` segundos
-
-Também há retry automático para erros temporários, como:
-
-- `403`
-- `408`
-- `429`
-- `5xx`
-
-Isso ajuda a reduzir bloqueios e falhas intermitentes.
-
-## Logs
-
-Durante a execução, o script escreve logs no terminal com os prefixos:
-
-- `[info]`
-- `[warn]`
-- `[error]`
-
-Os logs mostram, por exemplo:
-
-- arquivo de cookies carregado
-- caminho do SQLite
-- categoria atual
-- target processado
-- quantidade de produtos novos
-- duplicados ignorados
-- status do webhook
-
-## Limitações e cuidados
-
-- O projeto depende da estrutura HTML atual do Mercado Livre; mudanças no site podem quebrar a extração.
-- Cookies inválidos ou expirados podem causar páginas incompletas, bloqueios ou falhas na geração de afiliado.
-- O arquivo `cookies.json` pode conter dados sensíveis e não deve ser versionado publicamente.
-- O webhook é obrigatório no fluxo padrão; com `--no-webhook`, o script encerra sem marcar itens como enviados.
-- Como há delays intencionais, execuções grandes podem demorar bastante.
-
-## Exemplos úteis
-
-```bash
-node fetch-mercadolivre-products.js --targets-file targets.json --deal-of-day --lightning --limit 5
-```
-
-```bash
-node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/ofertas?category=MLB264586" --limit 10 --max-pages 4
-```
-
-```bash
-node fetch-mercadolivre-products.js "https://www.mercadolivre.com.br/p/MLB12345678" --affiliate-tag sua_tag --compact
-```
-
-## Troubleshooting
-
-### O script diz que não encontrou produto
-
-Possíveis causas:
-
-- URL inválida
-- página protegida/bloqueada
-- HTML mudou
-- cookies desatualizados
-
-### O webhook falha
-
-Verifique:
-
-- se a URL está correta
-- se o endpoint aceita `POST` com `application/json`
-- se houve resposta HTTP `4xx` ou `5xx`
-
-### Nenhum produto novo aparece
-
-Pode ser que:
-
-- os produtos já estejam registrados no SQLite
-- a listagem não tenha itens extraíveis
-- o limite esteja muito baixo
-
-## Segurança
-
-Recomendações:
-
-- Adicione `cookies.json` ao `.gitignore` se ele for pessoal.
-- Não compartilhe o banco SQLite se ele contiver histórico operacional sensível.
-- Revise o webhook padrão antes de usar em produção.
-
-## Melhorias futuras sugeridas
-
-- Criar `package.json` com scripts de execução.
-- Adicionar suporte a variáveis de ambiente.
-- Salvar payloads localmente para debug.
-- Criar testes para os extratores HTML.
-- Exportar resultados também para arquivo `.json`.
-
-## Arquivo principal
-
-Se quiser começar pelo código, o ponto de entrada é [fetch-mercadolivre-products.js](/c:/Users/Pichau/Desktop/dropshipping/fetch-mercadolivre-products.js).
-## Estrutura atual
-
-- `fetch-mercadolivre-products.js` ficou apenas como bootstrap da CLI.
-- `lib/run.js` concentra a orquestracao principal.
-- `lib/collector.js` cuida do fluxo de coleta por target.
-- `lib/product-parser.js` concentra a extracao de dados do HTML.
-- `lib/network.js`, `lib/storage.js`, `lib/cookies.js`, `lib/cli.js` e `lib/constants.js` separam infraestrutura e utilitarios.
-## Modo servico
-
-O script agora roda em loop continuo por padrao, pensado para uso com `pm2`. Ao concluir um ciclo completo da lista de targets, ele espera `60000ms` e reinicia automaticamente.
-
-No modo servico, o loop tambem entra em pausa automaticamente entre `22:00` e `07:00`, usando o horario local da maquina onde o processo estiver rodando. Se o processo iniciar dentro dessa janela, ele aguarda ate `07:00` antes de comecar um novo ciclo.
-
-Use `--no-loop` quando quiser executar apenas uma vez e encerrar.
-
-Tambem foi adicionada a opcao `--loop-delay-ms <n>` para controlar o intervalo entre ciclos.
-
-### Exemplos com PM2
-
-```bash
-pm2 start fetch-mercadolivre-products.js --name mercadolivre-dropshipping -- --targets-file targets.json
-```
-
-```bash
-pm2 start fetch-mercadolivre-products.js --name mercadolivre-dropshipping -- --targets-file targets.json --loop-delay-ms 120000
-```
-
-```bash
-pm2 start fetch-mercadolivre-products.js --name mercadolivre-dropshipping -- --targets-file targets.json --no-loop
-```
+Distribuído sob a licença [MIT](LICENSE).

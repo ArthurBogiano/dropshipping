@@ -1,1 +1,23 @@
-mercadolivre-products.sqlite
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+cookies*.json
+!cookies.example.json
+targets*.json
+!targets.example.json
+
+# Runtime data
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Node.js and editor artifacts
+node_modules/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

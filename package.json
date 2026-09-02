@@ -1,0 +1,37 @@
+{
+  "name": "mercado-livre-offer-collector",
+  "version": "1.0.0",
+  "description": "Coletor de ofertas do Mercado Livre com afiliados, deduplicacao SQLite e webhooks.",
+  "license": "MIT",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "ml-offers": "./fetch-mercadolivre-products.js"
+  },
+  "scripts": {
+    "start": "node fetch-mercadolivre-products.js",
+    "check": "node scripts/check.js",
+    "test": "node --test --test-reporter=spec",
+    "audit:public": "node scripts/audit-public-tree.js",
+    "ci": "npm run check && npm test && npm run audit:public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ArthurBogiano/dropshipping.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ArthurBogiano/dropshipping/issues"
+  },
+  "homepage": "https://github.com/ArthurBogiano/dropshipping#readme",
+  "keywords": [
+    "mercado-livre",
+    "affiliate-marketing",
+    "webhook",
+    "dropshipping",
+    "nodejs",
+    "sqlite"
+  ]
+}
